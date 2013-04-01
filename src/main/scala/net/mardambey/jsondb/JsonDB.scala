@@ -4,36 +4,133 @@ import akka.pattern.{ ask, pipe }
 import akka.actor._
 import akka.routing.SmallestMailboxRouter
 import akka.util.Timeout
-
 import com.jolbox.bonecp.BoneCP
 import com.jolbox.bonecp.BoneCPConfig
-
 import net.mardambey.jsondb.HttpServer.RequestHandler
-
 import org.jboss.netty.handler.codec.http.HttpRequest
-
 import scala.concurrent.duration._
 import scala.collection.JavaConversions._
 import scala.concurrent.Await
-
 import java.net.URLDecoder
 import java.util.LinkedList
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeoutException
+import java.io.ByteArrayInputStream
+import java.util.zip.GZIPInputStream
+import java.io.ObjectInputStream
+import java.io.ByteArrayOutputStream
+import java.util.zip.GZIPOutputStream
+import java.io.ObjectOutputStream
+import java.util.zip.DeflaterOutputStream
+import java.util.zip.InflaterInputStream
+import org.mapdb.DBMaker
+import java.io.File
+import java.util.concurrent.ConcurrentNavigableMap
+
+/**
+ * TODO: return JSON or JSONP
+ * TODO: parser SQL for better caching
+ * TODO: implement cache expiry
+ * TODO: stored queries (user gives in query alias)
+ * TODO: refreshable stored queries
+ */
 
 case class Query(q:String)
 
+trait Cache {
+  def put(key:Int, r:Result)
+  def get(key:Int) : Result
+  def exists(key:Int) : Boolean
+  def shutdown()
+}
+
+class DiskCache extends Cache {
+  
+  val cacheDb = DBMaker.newFileDB(new File("/tmp/jsondb.dat"))
+  .cacheLRUEnable()
+  .compressionEnable()
+  .closeOnJvmShutdown()               
+  .make()
+               
+  val cache = cacheDb.getTreeMap("jsondb-cache").asInstanceOf[ConcurrentNavigableMap[Int,Array[Byte]]]
+  
+  def put (key:Int, r:Result) {
+    val baos = new ByteArrayOutputStream();
+    val oos = new ObjectOutputStream(baos);
+    try {
+    oos.writeObject(r)
+    oos.close()    
+    cache += (key -> baos.toByteArray())
+    cacheDb.commit()
+    } catch {
+      case e:Exception => println("could not add to cache %s %s".format(e.getMessage(), e.getStackTraceString)) 
+    }
+  }
+  
+  def get(key:Int) : Result = {
+    val bytes = cache.get(key)
+    bytes match {
+      case null => null
+      case _ => {
+        val ois = new ObjectInputStream(new ByteArrayInputStream(bytes));
+        ois.readObject().asInstanceOf[Result]
+      }
+    }
+  }
+  
+  def exists(key:Int) : Boolean = cache.containsKey(key)
+  
+  def shutdown() {
+    cacheDb.close()
+  }
+}
+
+class InMemoryCache extends Cache {
+  
+  val cache = new ConcurrentHashMap[Int, Array[Byte]]()
+  
+  def put (key:Int, r:Result) {
+    val baos = new ByteArrayOutputStream();
+    val oos = new ObjectOutputStream(new GZIPOutputStream(baos));
+    try {
+    oos.writeObject(r)
+    oos.close()
+    cache += (key -> baos.toByteArray())
+    }
+    catch {
+      case e:Exception => println("could not add to cache %s %s".format(e.getMessage(), e.getStackTraceString)) 
+    }
+  }
+  
+  def get(key:Int) : Result = {
+    val bytes = cache.get(key)
+    
+    bytes match {
+      case null => null
+      case _ => {
+        val ois = new ObjectInputStream(new GZIPInputStream(new ByteArrayInputStream(bytes)));
+        ois.readObject().asInstanceOf[Result]
+      }
+    }
+  }
+  
+  def exists(key:Int) : Boolean = cache.containsKey(key)
+  
+  def shutdown() {}
+}
+
 object Database {
-  val cache = new ConcurrentHashMap[Int, Result]()
-	val system = ActorSystem("JsonDB")
-	val WORKERS_MAX_NUM = 5
-	val database = system.actorOf(Props[Database].withRouter(SmallestMailboxRouter(nrOfInstances=WORKERS_MAX_NUM)))
+  val cache = new DiskCache()
+  val system = ActorSystem("JsonDB")
+  val WORKERS_MAX_NUM = 5
+  val database = system.actorOf(Props[Database].withRouter(SmallestMailboxRouter(nrOfInstances=WORKERS_MAX_NUM)))
 	
-	sys.addShutdownHook {
-		system.shutdown()
-	}
+  sys.addShutdownHook {
+	  system.shutdown()
+	  cache.shutdown()
+  }
 	
-	def apply() = database
+  def apply() = database
 }
 
 class Database extends Actor {
@@ -54,46 +151,51 @@ class Database extends Actor {
 	  case Query(q) => {
 			try {
 
-			  if (Database.cache.containsKey(q.hashCode)) {
+			  if (Database.cache.exists(q.hashCode)) {
 				  println("Cache hit: %s".format(q))
-				  sender ! Database.cache(q.hashCode)
+				  sender ! Database.cache.get(q.hashCode)
 			  } else {			  
-			  println("cache=%s".format(Database.cache.keySet.mkString(",")))
-			  val conn = pool.getConnection()
-			  val st = conn.createStatement()
-			  val rs = st.executeQuery(q)
-			  
-			  val rsmd = rs.getMetaData()
-			  
-			  val colNames = new LinkedList[String]()
-			  val colValues = new LinkedList[LinkedList[String]]()
-			  
-			  colValues.append(colNames)
-			  
-			  for (i <- 1 to rsmd.getColumnCount()) {			    
-			      colNames.add(rsmd.getColumnLabel(i))
-			  }
-			  		
-			  println(colNames.mkString(","))
-			  while(rs.next()) {
-			    val row = new LinkedList[String]()
-			    
-			    try {
-				    for (i <- 1 to rsmd.getColumnCount()) {			      
-				      val v = rs.getString(i)
-				      row.add(if (v == null) "" else v)
-				    }
-				    
-				    colValues.add(row)
-			    } catch {
-			      case _:Throwable =>
-			    }
-			  }
-			  
-			  val r = new Result(colValues)
-			  println("caching %s".format(q.hashCode))
-			  Database.cache += (q.hashCode -> r)
-			  sender ! r
+				  val conn = pool.getConnection()
+				  val st = conn.createStatement()
+				  val rs = st.executeQuery(q)
+				  
+				  val rsmd = rs.getMetaData()
+				  
+				  val colNames = new LinkedList[String]()
+				  val colValues = new LinkedList[LinkedList[String]]()
+				  
+				  colValues.append(colNames)
+				  
+				  for (i <- 1 to rsmd.getColumnCount()) {			    
+				      colNames.add(rsmd.getColumnLabel(i))
+				  }
+				  		
+				  println(colNames.mkString(","))
+				  
+				  try {
+					  while(rs.next()) {
+					    val row = new LinkedList[String]()
+					    
+					    try {
+						    for (i <- 1 to rsmd.getColumnCount()) {			      
+						      val v = rs.getString(i)
+						      row.add(if (v == null) "" else v)
+						    }
+						    
+						    colValues.add(row)
+					    } catch {
+					      case _:Throwable =>
+					    }
+					  }
+				  } catch {
+				    case e:Exception => log.severe("Error fetching next row: %s\n%s".format(e.getMessage, e.getStackTraceString))
+				  }
+				  
+				  val r = new Result(colValues)
+				  println("caching %s".format(q.hashCode))
+				  Database.cache.put(q.hashCode,r)
+				  println("caching %s done".format(q.hashCode))
+				  sender ! r
 			  }
 			} catch {
   				case e:Exception => log.severe("Could not execute query: %s\n%s".format(e.getMessage, e.getStackTrace().mkString("\n")))
@@ -104,7 +206,7 @@ class Database extends Actor {
 	}
 }
 
-class Result(data:LinkedList[LinkedList[String]]) {
+@serializable class Result(data:LinkedList[LinkedList[String]]) {
   def toJson() : String = {
     "[" + data.map(row => {
       "[" + row.map(v => """"""" + v.replace(""""""", """\"""") + """"""").mkString(",") + "]"
