@@ -26,10 +26,12 @@ import java.util.zip.InflaterInputStream
 import org.mapdb.DBMaker
 import java.io.File
 import java.util.concurrent.ConcurrentNavigableMap
+import com.typesafe.config.ConfigFactory
 
 /**
+ * TODO: add config file
  * TODO: return JSON or JSONP
- * TODO: parser SQL for better caching
+ * TODO: parse SQL for better caching
  * TODO: implement cache expiry
  * TODO: stored queries (user gives in query alias)
  * TODO: refreshable stored queries
@@ -37,22 +39,33 @@ import java.util.concurrent.ConcurrentNavigableMap
 
 case class Query(q:String)
 
+object Config {
+  protected val config = ConfigFactory.load()
+  
+  def apply() = config
+}
+
 trait Cache {
   def put(key:Int, r:Result)
   def get(key:Int) : Result
   def exists(key:Int) : Boolean
-  def shutdown()
+  def shutdown() {}
 }
 
 class DiskCache extends Cache {
   
-  val cacheDb = DBMaker.newFileDB(new File("/tmp/jsondb.dat"))
+  protected val cacheDbFile = Config().getString("jsondb.db.file") match {
+    case null => "/tmp/jsondb.dat"
+    case s => s
+  }
+  
+  protected val cacheDb = DBMaker.newFileDB(new File(cacheDbFile))
   .cacheLRUEnable()
   .compressionEnable()
   .closeOnJvmShutdown()               
   .make()
                
-  val cache = cacheDb.getTreeMap("jsondb-cache").asInstanceOf[ConcurrentNavigableMap[Int,Array[Byte]]]
+  protected val cache = cacheDb.getTreeMap("jsondb-cache").asInstanceOf[ConcurrentNavigableMap[Int,Array[Byte]]]
   
   def put (key:Int, r:Result) {
     val baos = new ByteArrayOutputStream();
@@ -80,14 +93,14 @@ class DiskCache extends Cache {
   
   def exists(key:Int) : Boolean = cache.containsKey(key)
   
-  def shutdown() {
+  override def shutdown() {
     cacheDb.close()
   }
 }
 
 class InMemoryCache extends Cache {
   
-  val cache = new ConcurrentHashMap[Int, Array[Byte]]()
+  protected val cache = new ConcurrentHashMap[Int, Array[Byte]]()
   
   def put (key:Int, r:Result) {
     val baos = new ByteArrayOutputStream();
@@ -114,9 +127,7 @@ class InMemoryCache extends Cache {
     }
   }
   
-  def exists(key:Int) : Boolean = cache.containsKey(key)
-  
-  def shutdown() {}
+  def exists(key:Int) : Boolean = cache.containsKey(key)  
 }
 
 object Database {
@@ -134,76 +145,78 @@ object Database {
 }
 
 class Database extends Actor {
+    
   val log = java.util.logging.Logger.getLogger(getClass.getName)
+  
   Class.forName("com.mysql.jdbc.Driver")
+  
+  val config = new BoneCPConfig()
+  config.setJdbcUrl(Config().getString("jsondb.db.url"))
+  config.setUsername(Config().getString("jsondb.db.username"))
+  config.setPassword(Config().getString("jsondb.db.password"))
+  config.setMinConnectionsPerPartition(5)
+  config.setMaxConnectionsPerPartition(10)
+  config.setPartitionCount(1)
 	
-	val config = new BoneCPConfig()	
-	config.setJdbcUrl("jdbc:mysql://aspen.evo:3306/general?zeroDateTimeBehavior=round&amp;jdbcCompliantTruncation=false")
-	config.setUsername("slave")
-	config.setPassword("password")
-	config.setMinConnectionsPerPartition(5)
-	config.setMaxConnectionsPerPartition(10)
-	config.setPartitionCount(1)
+  val pool = new BoneCP(config)
 	
-	val pool = new BoneCP(config)
-	
-	def receive = {
-	  case Query(q) => {
-			try {
-
-			  if (Database.cache.exists(q.hashCode)) {
-				  println("Cache hit: %s".format(q))
-				  sender ! Database.cache.get(q.hashCode)
-			  } else {			  
-				  val conn = pool.getConnection()
-				  val st = conn.createStatement()
-				  val rs = st.executeQuery(q)
-				  
-				  val rsmd = rs.getMetaData()
-				  
-				  val colNames = new LinkedList[String]()
-				  val colValues = new LinkedList[LinkedList[String]]()
-				  
-				  colValues.append(colNames)
-				  
-				  for (i <- 1 to rsmd.getColumnCount()) {			    
-				      colNames.add(rsmd.getColumnLabel(i))
-				  }
-				  		
-				  println(colNames.mkString(","))
-				  
-				  try {
-					  while(rs.next()) {
-					    val row = new LinkedList[String]()
-					    
-					    try {
-						    for (i <- 1 to rsmd.getColumnCount()) {			      
-						      val v = rs.getString(i)
-						      row.add(if (v == null) "" else v)
-						    }
-						    
-						    colValues.add(row)
-					    } catch {
-					      case _:Throwable =>
-					    }
-					  }
-				  } catch {
-				    case e:Exception => log.severe("Error fetching next row: %s\n%s".format(e.getMessage, e.getStackTraceString))
-				  }
-				  
-				  val r = new Result(colValues)
-				  println("caching %s".format(q.hashCode))
-				  Database.cache.put(q.hashCode,r)
-				  println("caching %s done".format(q.hashCode))
-				  sender ! r
+  def receive = {
+    case Query(q) => {
+      try {
+        if (Database.cache.exists(q.hashCode)) {
+          println("Cache hit: %s".format(q))
+		  sender ! Database.cache.get(q.hashCode)
+        } else {          
+		  val conn = pool.getConnection()
+		  val st = conn.createStatement()
+		  val rs = st.executeQuery(q)
+		  
+		  val rsmd = rs.getMetaData()
+		  
+		  val colNames = new LinkedList[String]()
+		  val colValues = new LinkedList[LinkedList[String]]()
+		  
+		  colValues.append(colNames)
+		  
+		  for (i <- 1 to rsmd.getColumnCount()) {			    
+		      colNames.add(rsmd.getColumnLabel(i))
+		  }
+		  		
+		  println(colNames.mkString(","))
+		  
+		  try {
+			  while(rs.next()) {
+			    val row = new LinkedList[String]()
+			    
+			    try {
+				    for (i <- 1 to rsmd.getColumnCount()) {			      
+				      val v = rs.getString(i)
+				      row.add(if (v == null) "" else v)
+				    }
+				    
+				    colValues.add(row)
+			    } catch {
+			      case _:Throwable =>
+			    }
 			  }
-			} catch {
-  				case e:Exception => log.severe("Could not execute query: %s\n%s".format(e.getMessage, e.getStackTrace().mkString("\n")))
-			}
-		}
-				
-		case x => log.warning("Received unknown message %s".format(x))
+		  } catch {
+		    case e:Exception => log.severe("Error fetching next row: %s\n%s".format(e.getMessage, e.getStackTraceString))
+		  }
+		  
+		  val r = new Result(colValues)
+		  println("caching %s".format(q.hashCode))
+		  Database.cache.put(q.hashCode,r)
+		  println("caching %s done".format(q.hashCode))
+		  sender ! r
+		
+        }      
+      } catch {
+		case e:Exception => log.severe("Could not execute query: %s\n%s".format(e.getMessage, e.getStackTrace().mkString("\n")))
+      }
 	}
+				
+    case x => log.warning("Received unknown message %s".format(x))
+  }
 }
 
 @serializable class Result(data:LinkedList[LinkedList[String]]) {
