@@ -29,7 +29,6 @@ import java.util.concurrent.ConcurrentNavigableMap
 import com.typesafe.config.ConfigFactory
 
 /**
- * TODO: add config file
  * TODO: return JSON or JSONP
  * TODO: parse SQL for better caching
  * TODO: implement cache expiry
