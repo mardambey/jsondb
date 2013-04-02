@@ -41,8 +41,7 @@ import com.fasterxml.jackson.core.`type`.TypeReference
  * TODO: implement cache expiry
  * TODO: stored queries (user gives in query alias)
  * TODO: automatically refreshable stored queries
- * TODO: optimize Result object
- * TODO: serialize calls to the same query / alias
+ * TODO: serialize calls to the same query / alias if still loading
  */
 
 case class Query(q:String)
