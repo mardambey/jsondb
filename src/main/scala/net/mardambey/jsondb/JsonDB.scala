@@ -27,13 +27,22 @@ import org.mapdb.DBMaker
 import java.io.File
 import java.util.concurrent.ConcurrentNavigableMap
 import com.typesafe.config.ConfigFactory
+import java.io.Externalizable
+import java.io.ObjectOutput
+import java.io.ObjectInput
+import scala.collection.mutable.ListBuffer
+import com.fasterxml.jackson.module.scala.DefaultScalaModule
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.core.`type`.TypeReference
 
 /**
  * TODO: return JSON or JSONP
  * TODO: parse SQL for better caching
  * TODO: implement cache expiry
  * TODO: stored queries (user gives in query alias)
- * TODO: refreshable stored queries
+ * TODO: automatically refreshable stored queries
+ * TODO: optimize Result object
+ * TODO: serialize calls to the same query / alias
  */
 
 case class Query(q:String)
@@ -53,6 +62,8 @@ trait Cache {
 
 class DiskCache extends Cache {
   
+  val log = java.util.logging.Logger.getLogger(getClass.getName)
+  
   protected val cacheDbFile = Config().getString("jsondb.db.file") match {
     case null => "/tmp/jsondb.dat"
     case s => s
@@ -61,6 +72,7 @@ class DiskCache extends Cache {
   protected val cacheDb = DBMaker.newFileDB(new File(cacheDbFile))
   .cacheLRUEnable()
   .compressionEnable()
+  .checksumEnable()
   .closeOnJvmShutdown()               
   .make()
                
@@ -75,7 +87,7 @@ class DiskCache extends Cache {
     cache += (key -> baos.toByteArray())
     cacheDb.commit()
     } catch {
-      case e:Exception => println("could not add to cache %s %s".format(e.getMessage(), e.getStackTraceString)) 
+      case e:Exception => log.severe("Could not add to cache %s: %s\n%s".format(e.getClass(), e.getMessage(), e.getStackTraceString)) 
     }
   }
   
@@ -99,6 +111,8 @@ class DiskCache extends Cache {
 
 class InMemoryCache extends Cache {
   
+  protected val log = java.util.logging.Logger.getLogger(getClass.getName)
+  
   protected val cache = new ConcurrentHashMap[Int, Array[Byte]]()
   
   def put (key:Int, r:Result) {
@@ -110,7 +124,7 @@ class InMemoryCache extends Cache {
     cache += (key -> baos.toByteArray())
     }
     catch {
-      case e:Exception => println("could not add to cache %s %s".format(e.getMessage(), e.getStackTraceString)) 
+      case e:Exception => log.severe("Could not add to cache %s %s".format(e.getMessage(), e.getStackTraceString)) 
     }
   }
   
@@ -163,7 +177,7 @@ class Database extends Actor {
     case Query(q) => {
       try {
         if (Database.cache.exists(q.hashCode)) {
-          println("Cache hit: %s".format(q))
+          log.fine("Cache hit: %s".format(q))
 		  sender ! Database.cache.get(q.hashCode)
         } else {          
 		  val conn = pool.getConnection()
@@ -172,20 +186,20 @@ class Database extends Actor {
 		  
 		  val rsmd = rs.getMetaData()
 		  
-		  val colNames = new LinkedList[String]()
-		  val colValues = new LinkedList[LinkedList[String]]()
-		  
-		  colValues.append(colNames)
-		  
+		  val colNames = ListBuffer[String]()
+		  val colValues = ListBuffer[List[String]]()
+		  		  		  
 		  for (i <- 1 to rsmd.getColumnCount()) {			    
 		      colNames.add(rsmd.getColumnLabel(i))
 		  }
+		  
+		  colValues.add(colNames.toList)
 		  		
-		  println(colNames.mkString(","))
+		  log.fine(colNames.mkString(","))
 		  
 		  try {
 			  while(rs.next()) {
-			    val row = new LinkedList[String]()
+			    val row = new ListBuffer[String]()
 			    
 			    try {
 				    for (i <- 1 to rsmd.getColumnCount()) {			      
@@ -193,7 +207,7 @@ class Database extends Actor {
 				      row.add(if (v == null) "" else v)
 				    }
 				    
-				    colValues.add(row)
+				    colValues.add(row.toList)
 			    } catch {
 			      case _:Throwable =>
 			    }
@@ -202,10 +216,10 @@ class Database extends Actor {
 		    case e:Exception => log.severe("Error fetching next row: %s\n%s".format(e.getMessage, e.getStackTraceString))
 		  }
 		  
-		  val r = new Result(colValues)
-		  println("caching %s".format(q.hashCode))
+		  val r = new Result(colValues.toList)
+		  log.fine("caching %s".format(q.hashCode))
 		  Database.cache.put(q.hashCode,r)
-		  println("caching %s done".format(q.hashCode))
+		  log.fine("caching %s done".format(q.hashCode))
 		  sender ! r
 		
         }      
@@ -218,11 +232,74 @@ class Database extends Actor {
   }
 }
 
-@serializable class Result(data:LinkedList[LinkedList[String]]) {
+object Json {
+  
+  val log = java.util.logging.Logger.getLogger(getClass.getName)
+  
+  val mapper = new ObjectMapper()
+  mapper.registerModule(DefaultScalaModule)
+  
+  def toJson(o:Any) : String = {
+    mapper.writeValueAsString(o)
+  }
+  
+  def fromJson(json:String, clz:Class[_]) : Any = {
+    mapper.readValue(json, clz)
+  }
+  
+  def toJsonAsBytes(o:Any) : Array[Byte] = {
+    log.fine("writing json: %s".format(toJson(o)))
+    toJson(o).getBytes("UTF-8")
+  }
+  
+  def fromJsonBytes(bytes:Array[Byte], clz:Class[_]) : Any = {
+    log.fine("deserializing: %s".format(new String(bytes, "UTF-8")))
+    fromJson(new String(bytes, "UTF-8"), clz)
+  }
+}
+
+@serializable class Result(var data:List[List[String]]) extends Externalizable {
+  
+  val log = java.util.logging.Logger.getLogger(getClass.getName)
+
+  val BYTE_SIZE = 4
+  
+  def this() {
+    this(List[List[String]]())
+  }
+  
   def toJson() : String = {
-    "[" + data.map(row => {
-      "[" + row.map(v => """"""" + v.replace(""""""", """\"""") + """"""").mkString(",") + "]"
-    }).mkString(",\n") + "]"    
+    Json.toJson(data)
+  }
+    
+  def writeExternal(out:ObjectOutput) {
+    log.fine("serializing data=%s".format(data))
+    val b = Json.toJsonAsBytes(data)
+    log.fine("writing byte[] of length %s".format(b.length))
+    out.writeInt(b.length)
+    out.write(b)
+  }
+  
+  def readExternal(in:ObjectInput) {
+    
+    val size = in.readInt()
+    data = if (size <= 0) {
+      List[List[String]]()
+    } else {      
+      log.fine("reading byte[] of length %s".format(size))
+      val bytes = new Array[Byte](size)
+      in.readFully(bytes)
+        
+      try {
+        Json.fromJsonBytes(bytes, classOf[List[List[String]]]).asInstanceOf[List[List[String]]]
+      } catch {
+        case e:Exception => {
+          log.severe("Could not desrialize object from the cache %s: %s\n%s"
+              .format(e.getMessage, e.getClass, e.getStackTraceString))
+          List[List[String]]()
+        }
+      }
+    }
   }
 }
 
