@@ -8,13 +8,19 @@ import java.util.logging.Logger
 
 object Scheduler {
   
-    implicit val system = ActorSystem("JsonDB")
-    import system.dispatcher // ExecutionContext
-        
-    def schedule(q:Query) = if (q.refreshInterval > 0) {
-      system.scheduler.schedule(0 seconds, q.refreshInterval seconds, QueryReloader(), Reload(q))      
-      true
-    } else false    
+  protected var log = Logger.getLogger(getClass.getName) 
+  implicit val system = ActorSystem("JsonDB")
+  import system.dispatcher // ExecutionContext
+    
+  def schedule(queries:Map[String, Query]) : Option[Map[String, Query]] = {
+	Some(queries.filter(q => schedule(q._2)))
+  }
+
+  def schedule(q:Query) = if (q.refreshInterval > 0) {
+	log.info("Scheduling query %s to reload every %s".format(q.alias, q.refreshInterval))
+	system.scheduler.schedule(0 seconds, q.refreshInterval seconds, QueryReloader(), Reload(q))      
+	true
+  } else false
 }
 
 case class Reload(q:Query)

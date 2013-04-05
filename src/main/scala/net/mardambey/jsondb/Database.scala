@@ -12,7 +12,7 @@ import akka.actor.ActorSystem
 import akka.actor.Props
 import akka.routing.SmallestMailboxRouter
 
-case class Query(q:String, refreshInterval:Int = 0)
+case class Query(q:String, alias:Option[String], refreshInterval:Int = 0)
 case class Load(q:Query, refresh:Boolean = false)
 
 object Database {
@@ -46,6 +46,7 @@ class Database extends Actor {
   val pool = new BoneCP(config)
 	
   def load(q:Query) : Result = {
+    log.info("Loading query %s".format(q))
     val conn = pool.getConnection()
     val st = conn.createStatement()
     val rs = st.executeQuery(q.q)
@@ -99,9 +100,9 @@ class Database extends Actor {
         } else {
           
           val r = load(q)
-		  log.fine("caching %s".format(q.hashCode))
+		  log.fine("Caching %s...".format(q.hashCode))
 		  Database.cache.put(q.hashCode, r)
-		  log.fine("caching %s done".format(q.hashCode))
+		  log.fine("Caching %s done!".format(q.hashCode))
 		  sender ! r		
         }      
       } catch {

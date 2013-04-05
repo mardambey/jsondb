@@ -15,24 +15,41 @@ import java.util.concurrent.TimeoutException
  * TODO: return JSON or JSONP
  * TODO: parse SQL for better caching
  * TODO: implement cache expiry
- * TODO: stored queries (user gives in query alias)
- * TODO: automatically refreshable stored queries
  * TODO: serialize calls to the same query / alias if still loading
  */
 
 object JsonDB extends App {
   val log = java.util.logging.Logger.getLogger(getClass.getName)
   val SQLQuery = """/query\?sql=(.*)""".r
+  val QSTORE_CLASS = "jsondb.qstore.class"
+  val HTTPD_PORT = 8080
   implicit val timeout = Timeout(600 seconds)
   
-  val httpd = new HttpServer(8080)
+  log.info("Checking configuration for QueryStore implementation")
+  
+  if (Config().hasPath(QSTORE_CLASS)) {
+    val c = Config().getString(QSTORE_CLASS) 
+    log.info("Found QueryStore class: %s".format(c))
+    
+    try {
+      QueryStore.init()      
+      QueryStore().get.getQueries().flatMap(Scheduler.schedule(_))
+    } catch {
+      case e:Exception => log.severe("Failed while loading QueryStore configuration: %s - %s\n%s".format(e.getClass, e.getMessage, e.getStackTraceString))
+    }
+  }
+  
+  def foo(a:Any) : Option[_] = {None}
+  
+  log.info("Binding Http server to port %s".format(HTTPD_PORT))
+  val httpd = new HttpServer(HTTPD_PORT)
   	httpd.addHandler("/query", new net.mardambey.jsondb.HttpServer.RequestHandler() {
   	  
 	  def handle(req:HttpRequest) : String = {
 	    try {
 		    req.getUri() match {
 		      case SQLQuery(q) => {
-		        val future = Database() ? Load(Query(URLDecoder.decode(q, "UTF-8")), refresh = false)
+		        val future = Database() ? Load(Query(URLDecoder.decode(q, "UTF-8"), alias=None, refreshInterval=0), refresh = false)
 		        val result = Await.result(future, timeout.duration).asInstanceOf[Result]
 		        "jsonp(%s)".format(result.toJson)	        
 		      }
