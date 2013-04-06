@@ -12,7 +12,7 @@ import akka.actor.ActorSystem
 import akka.actor.Props
 import akka.routing.SmallestMailboxRouter
 
-case class Query(q:String, alias:Option[String], refreshInterval:Int = 0)
+case class Query(var q:Option[String], var alias:Option[String], refreshInterval:Int = 0)
 case class Load(q:Query, refresh:Boolean = false)
 
 object Database {
@@ -49,7 +49,7 @@ class Database extends Actor {
     log.info("Loading query %s".format(q))
     val conn = pool.getConnection()
     val st = conn.createStatement()
-    val rs = st.executeQuery(q.q)
+    val rs = st.executeQuery(q.q.get)
   
     val rsmd = rs.getMetaData()
   
@@ -86,35 +86,75 @@ class Database extends Actor {
     new Result(colValues.toList)
   }
   
-  def receive = {
-    case Load(q, true)=> { //refresh
-      val r = load(q)
-      
-    }
-    case Load(q, false) => { // don't refresh
-      try {
+  def cacheLoad(q:Query) : Option[Result] = {
+    try {
         if (Database.cache.exists(q.hashCode)) {
           
           log.fine("Cache hit: %s".format(q))
-		  sender ! Database.cache.get(q.hashCode)
+		  Some(Database.cache.get(q.hashCode))
         } else {
           
           val r = load(q)
 		  log.fine("Caching %s...".format(q.hashCode))
 		  Database.cache.put(q.hashCode, r)
 		  log.fine("Caching %s done!".format(q.hashCode))
-		  sender ! r		
+		  Some(r)
         }      
       } catch {
 		case e:Exception => log.severe("Could not execute query: %s\n%s".format(e.getMessage, e.getStackTrace().mkString("\n")))
+		None
       }
+  }
+  
+  def loadAlias(q:Query) : Option[Result] = if (QueryStore.isInit) {
+    QueryStore().get.load(q.alias.get, reload=false) match {
+      case Some(query) => Some(load(query))
+      case None => None
+    }        
+  } else {
+    None
+  }
+  
+  def cacheLoadAlias(q:Query) : Option[Result] = if (QueryStore.isInit) {
+    QueryStore().get.load(q.alias.get, reload=false) match {
+      case Some(query) => cacheLoad(query)
+      case None => None
+    }        
+  } else {
+    None
+  }
+  
+  def receive = {
+    // load from query
+    case Load(q @ Query(Some(_), _, _), true)=> { //refresh
+      sender ! load(q)      
+    }
+    case Load(q @ Query(Some(_), _, _), false) => { // don't refresh
+      sender ! cacheLoad(q)
 	}
+    
+    // load from alias
+    case Load(q @ Query(None, Some(alias), _), true)=> { //refresh
+      sender ! loadAlias(q)      
+    }
+    case Load(q @ Query(None, Some(alias), _), false) => { // don't refresh
+      sender ! cacheLoadAlias(q)
+	}
+    
 				
     case x => log.warning("Received unknown message %s".format(x))
   }
 }
 
-@serializable class Result(var data:List[List[String]]) extends Externalizable {
+trait ToJson {
+  def toJson() : String
+}
+
+case class EmptyResult() extends ToJson {
+  def toJson() : String = "[]"
+}
+
+@serializable class Result(var data:List[List[String]]) extends Externalizable with ToJson {
   
   val log = java.util.logging.Logger.getLogger(getClass.getName)
 

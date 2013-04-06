@@ -12,15 +12,14 @@ import scala.concurrent.Await
 import java.util.concurrent.TimeoutException
 
 /**
- * TODO: return JSON or JSONP
  * TODO: parse SQL for better caching
  * TODO: implement cache expiry
- * TODO: serialize calls to the same query / alias if still loading
  */
 
 object JsonDB extends App {
   val log = java.util.logging.Logger.getLogger(getClass.getName)
   val SQLQuery = """/query\.jsonp?\?sql=(.*)""".r
+  val AliasQuery = """/query\.jsonp?\?alias=(.*)""".r
   val QSTORE_CLASS = "jsondb.qstore.class"
   val HTTPD_PORT = 8080
   implicit val timeout = Timeout(600 seconds)
@@ -32,7 +31,7 @@ object JsonDB extends App {
     log.info("Found QueryStore class: %s".format(c))
     
     try {
-      QueryStore.init()      
+      QueryStore.init()
       QueryStore().get.getQueries().flatMap(Scheduler.schedule(_))
     } catch {
       case e:Exception => log.severe("Failed while loading QueryStore configuration: %s - %s\n%s".format(e.getClass, e.getMessage, e.getStackTraceString))
@@ -54,9 +53,15 @@ object JsonDB extends App {
   def handleRequest(req:HttpRequest) : String = try {
     req.getUri() match {
       case SQLQuery(q) => {
-        val future = Database() ? Load(Query(URLDecoder.decode(q, "UTF-8"), alias=None, refreshInterval=0), refresh = false)
-        val result = Await.result(future, timeout.duration).asInstanceOf[Result]
-        result.toJson
+        val future = Database() ? Load(Query(Some(URLDecoder.decode(q, "UTF-8")), alias=None, refreshInterval=0), refresh = false)
+        val result = Await.result(future, timeout.duration).asInstanceOf[Option[Result]]
+        result.getOrElse(EmptyResult()).toJson
+      }
+      
+      case AliasQuery(q) => {
+        val future = Database() ? Load(Query(None, alias=Some(q), refreshInterval=0), refresh = false)
+        val result = Await.result(future, timeout.duration).asInstanceOf[Option[Result]]
+        result.getOrElse(EmptyResult()).toJson
       }
       
       case u => """"["unknown":"%s"]""".format(u)

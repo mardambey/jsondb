@@ -12,8 +12,8 @@ object Scheduler {
   implicit val system = ActorSystem("JsonDB")
   import system.dispatcher // ExecutionContext
     
-  def schedule(queries:Map[String, Query]) : Option[Map[String, Query]] = {
-	Some(queries.filter(q => schedule(q._2)))
+  def schedule(queries:collection.mutable.Map[String, Query]) : Option[Map[String, Query]] = {
+	Some(queries.filter(q => schedule(q._2)).toMap[String, Query])
   }
 
   def schedule(q:Query) = if (q.refreshInterval > 0) {

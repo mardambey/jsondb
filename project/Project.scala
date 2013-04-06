@@ -11,6 +11,8 @@ object ProjectBuild extends Build {
       organization := "net.mardambey",
       version := "0.1-SNAPSHOT",
       scalaVersion := "2.10.0",
+			javaOptions in run +=	"-Xmx1G", 
+			fork in run := true,
       resolvers += "Typesafe Releases" at "http://repo.typesafe.com/typesafe/releases",
 			resolvers += "Sonatype Nexus Snapshots" at "https://oss.sonatype.org/content/repositories/snapshots",
       libraryDependencies += "com.typesafe.akka" % "akka-actor_2.10" % "2.1.1",
